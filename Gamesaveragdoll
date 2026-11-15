@@ -1,0 +1,551 @@
+--!strict
+-- ============================================================
+-- GK ASSIST v18 — ล้มลงจริง ไม่สะบัด ไม่ own goal
+-- ============================================================
+
+local Players           = game:GetService("Players")
+local RunService        = game:GetService("RunService")
+local CollectionService = game:GetService("CollectionService")
+local UIS               = game:GetService("UserInputService")
+local Workspace         = workspace
+local RS                = game:GetService("ReplicatedStorage")
+
+local LP = Players.LocalPlayer
+if not LP then return end
+
+local CFG = {
+    -- WALK
+    ActivateDistance = 40,
+    WalkSpeed        = 16,
+    Smoothness       = 0.08,
+    DeadZone         = 2.0,
+    IncomingConeDeg  = 100,
+    PredictSeconds   = 3.0,
+    GoalZonePad      = 12,
+
+    -- DIVE (ล้มจริง)
+    AutoDive         = true,
+    DiveTriggerRange = 8.0,
+    DiveMaxDistance  = 10.0,
+    DiveFallDur      = 0.40,   -- เวลาล้ม
+    DiveHoldDur      = 0.25,   -- เวลานอนติดพื้น
+    DiveGetupDur     = 0.45,   -- เวลาลุก
+    DiveDropHeight   = 2.5,    -- ตัวลงไปกี่ studs
+    DiveTiltDeg      = 80,     -- เอียงกี่องศา (80 = เกือบนอน)
+    DiveArcHeight    = 0.4,    -- arc ขึ้นนิดหน่อย
+    DiveCooldown     = 1.3,
+    MaxGKFromGoal    = 18,
+
+    -- UI
+    ShowStatus = true,
+    ShowMarker = true,
+    AssistOn   = true,
+}
+
+local char, root, isGK, myGoal
+local assistOn = true
+local assistVel = Vector3.new(0,0,0)
+local lastDive = 0
+local gui, statusLbl, toggleBtn, settingsBtn, settingsPanel
+local marker: Part? = nil
+
+local dive = {
+    active = false,
+    phase = "none",       -- "diving" | "hold" | "getup" | "none"
+    t0 = 0,
+    fallDur = 0,
+    fallFrom = Vector3.new(),
+    fallTo = Vector3.new(),
+    fallBaseY = 0,
+    baseRot = CFrame.new(),   -- ★ เก็บ rotation เริ่มต้น (ห้ามสะสม)
+    tilt = 0,
+    limbCollide = {},
+}
+
+local function now() return Workspace:GetServerTimeNow() end
+
+local function getBall(): BasePart?
+    for _, o in CollectionService:GetTagged("SoccerBall") do
+        if o:IsA("BasePart") and o:IsDescendantOf(Workspace) then return o end
+    end
+    return nil
+end
+
+local function detectMyGoal()
+    if not (root and char) then return end
+    local s = RS:FindFirstChild("Shared")
+    if s then s = s:FindFirstChild("Game") end
+    if s then s = s:FindFirstChild("PitchBounds") end
+    if not (s and s:IsA("ModuleScript")) then return end
+    local ok, PB = pcall(require, s)
+    if not ok or type(PB) ~= "table" or not PB.get then return end
+    local ok2, bounds = pcall(PB.get)
+    if not ok2 or not bounds or not bounds.goals then return end
+    local myPos = root.Position
+    local best, bestD = nil, math.huge
+    for _, g in bounds.goals do
+        if g.lo and g.hi then
+            local cx = (g.lo.X+g.hi.X)*0.5
+            local cy = (g.lo.Y+g.hi.Y)*0.5
+            local cz = (g.lo.Z+g.hi.Z)*0.5
+            local d = (Vector3.new(cx,cy,cz) - myPos).Magnitude
+            if d < bestD then bestD = d; best = g end
+        end
+    end
+    if not best then return end
+    local lo, hi = best.lo, best.hi
+    local center = Vector3.new((lo.X+hi.X)*0.5, (lo.Y+hi.Y)*0.5, (lo.Z+hi.Z)*0.5)
+    local side = best.side or ((myPos.X > center.X) and 1 or -1)
+    myGoal = { side=side, lo=lo, hi=hi, center=center, planeX=center.X }
+end
+
+local function gkNearGoal(): boolean
+    if not (root and myGoal) then return false end
+    return math.abs(root.Position.X - myGoal.planeX) <= CFG.MaxGKFromGoal
+end
+
+local function predictGoalCross(b: BasePart): Vector3?
+    if not myGoal then return nil end
+    local p, v = b.Position, b.AssemblyLinearVelocity
+    local g = Workspace.Gravity
+    local ga = b:GetAttribute("Gravity")
+    if type(ga) == "number" and ga > 0 then g = ga end
+    local planeX = myGoal.planeX
+    local vx = v.X
+    if math.abs(vx) < 0.5 then return nil end
+    local dx = planeX - p.X
+    if dx * vx <= 0 then return nil end
+    local t = dx / vx
+    if t <= 0 or t > CFG.PredictSeconds then return nil end
+    local crossZ = p.Z + v.Z * t
+    local crossY = p.Y + v.Y * t - 0.5 * g * t * t
+    local lo, hi = myGoal.lo, myGoal.hi
+    if crossZ < lo.Z - 3 or crossZ > hi.Z + 3 then return nil end
+    if crossY < lo.Y - 2 or crossY > hi.Y + 3 then return nil end
+    return Vector3.new(planeX, lo.Y + 0.5, crossZ)
+end
+
+local function incomingAngle(b: BasePart): number
+    if not myGoal then return -1 end
+    local v = b.AssemblyLinearVelocity
+    local flatV = Vector3.new(v.X, 0, v.Z)
+    if flatV.Magnitude < 2 then return -1 end
+    local toGoal = myGoal.center - b.Position
+    toGoal = Vector3.new(toGoal.X, 0, toGoal.Z)
+    if toGoal.Magnitude < 0.1 then return 0 end
+    return math.deg(math.acos(math.clamp(flatV.Unit:Dot(toGoal.Unit), -1, 1)))
+end
+
+------------------------------------------------------------------
+-- Walk
+------------------------------------------------------------------
+local function walkToward(target: Vector3, dt: number)
+    if not (char and root) then return end
+    local cur = root.Position
+    local delta = Vector3.new(target.X - cur.X, 0, target.Z - cur.Z)
+    local dist = delta.Magnitude
+    if dist < CFG.DeadZone then
+        assistVel = assistVel:Lerp(Vector3.new(0,0,0), 0.3)
+        if assistVel.Magnitude < 0.1 then assistVel = Vector3.new(0,0,0) end
+    else
+        local targetSpeed = math.min(dist * 1.5, CFG.WalkSpeed)
+        if dist < 4 then targetSpeed = targetSpeed * (dist / 4) end
+        local wantVel = delta.Unit * targetSpeed
+        assistVel = assistVel:Lerp(wantVel, CFG.Smoothness)
+    end
+    if assistVel.Magnitude > CFG.WalkSpeed then
+        assistVel = assistVel.Unit * CFG.WalkSpeed
+    end
+    if assistVel.Magnitude < 0.1 then
+        assistVel = Vector3.new(0,0,0)
+        return
+    end
+    local newPos = cur + assistVel * dt
+    if myGoal then
+        newPos = Vector3.new(
+            math.clamp(newPos.X, myGoal.lo.X - CFG.GoalZonePad, myGoal.hi.X + CFG.GoalZonePad),
+            newPos.Y,
+            math.clamp(newPos.Z, myGoal.lo.Z - CFG.GoalZonePad, myGoal.hi.Z + CFG.GoalZonePad))
+    end
+    local cf = root.CFrame
+    local newCF = CFrame.new(newPos) * (cf - cf.Position)
+    pcall(function() char:PivotTo(newCF) end)
+end
+
+------------------------------------------------------------------
+-- DIVE — ล้มลงจริง ไม่สะบัด
+------------------------------------------------------------------
+local function smoothstep(t: number): number
+    t = math.clamp(t, 0, 1)
+    return t * t * (3 - 2 * t)
+end
+
+local function startDive(targetZ: number)
+    if not (char and root) then return end
+    local from = root.Position
+    local to = Vector3.new(from.X, from.Y, targetZ)
+    local dist = math.abs(targetZ - from.Z)
+    if dist < 0.3 then return end
+
+    dive.active = true
+    dive.phase = "diving"
+    dive.t0 = now()
+    dive.fallDur = math.clamp(0.30 + dist * 0.018, 0.30, 0.45)
+    dive.fallFrom = from
+    dive.fallTo = to
+    dive.fallBaseY = from.Y
+    dive.baseRot = root.CFrame - root.CFrame.Position   -- ★ เก็บ rotation เริ่มต้น
+    dive.tilt = ((targetZ > from.Z) and 1 or -1) * math.rad(CFG.DiveTiltDeg)
+
+    -- ปิด collision แขนชั่วคราว (กัน own goal)
+    dive.limbCollide = {}
+    for _, n in {"LeftHand","RightHand","LeftLowerArm","RightLowerArm","LeftArm","RightArm"} do
+        local limb = char:FindFirstChild(n)
+        if limb and limb:IsA("BasePart") then
+            dive.limbCollide[limb] = limb.CanCollide
+            limb.CanCollide = false
+        end
+    end
+end
+
+local function updateDive()
+    if not dive.active then return end
+    if not (char and root and root.Parent) then
+        dive.active = false
+        dive.phase = "none"
+        -- คืน collision แขน
+        for limb, c in dive.limbCollide do
+            if limb and limb.Parent then limb.CanCollide = c end
+        end
+        dive.limbCollide = {}
+        return
+    end
+
+    local t = now() - dive.t0
+
+    -- ======= PHASE: diving (ล้ม) =======
+    if dive.phase == "diving" then
+        local p = math.clamp(t / dive.fallDur, 0, 1)
+        local ease = smoothstep(p)
+
+        -- tilt ramps เร็ว (ติดพื้นตอนจบ)
+        local tiltAmt = math.min(p * 1.5, 1) * dive.tilt
+        -- drop Y ramps เร็ว
+        local dropAmt = math.min(p * 1.5, 1) * CFG.DiveDropHeight
+        -- arc ขึ้นนิดหน่อยแล้วลง
+        local arc = math.sin(p * math.pi) * CFG.DiveArcHeight
+
+        local horizX = dive.fallFrom.X + (dive.fallTo.X - dive.fallFrom.X) * ease
+        local horizZ = dive.fallFrom.Z + (dive.fallTo.Z - dive.fallFrom.Z) * ease
+
+        local pos = Vector3.new(horizX, dive.fallBaseY - dropAmt + arc, horizZ)
+        -- ★ ใช้ baseRot (ห้าม cf ปัจจุบัน = ไม่สะสม rotation)
+        local newCF = CFrame.new(pos) * (dive.baseRot * CFrame.Angles(0, 0, tiltAmt))
+        pcall(function() char:PivotTo(newCF) end)
+
+        if p >= 1 then
+            dive.phase = "hold"
+            dive.t0 = now()
+        end
+        return
+    end
+
+    -- ======= PHASE: hold (นอนติดพื้น) =======
+    if dive.phase == "hold" then
+        -- คงท่าเดิม ไม่ขยับ
+        if t >= CFG.DiveHoldDur then
+            dive.phase = "getup"
+            dive.t0 = now()
+        end
+        return
+    end
+
+    -- ======= PHASE: getup (ลุก) =======
+    if dive.phase == "getup" then
+        local p = math.clamp(t / CFG.DiveGetupDur, 0, 1)
+        local ease = smoothstep(p)
+
+        local tiltAmt = (1 - ease) * dive.tilt
+        local dropAmt = (1 - ease) * CFG.DiveDropHeight
+
+        local pos = Vector3.new(dive.fallTo.X, dive.fallBaseY - dropAmt, dive.fallTo.Z)
+        local newCF = CFrame.new(pos) * (dive.baseRot * CFrame.Angles(0, 0, tiltAmt))
+        pcall(function() char:PivotTo(newCF) end)
+
+        if p >= 1 then
+            -- คืน collision แขน
+            for limb, c in dive.limbCollide do
+                if limb and limb.Parent then limb.CanCollide = c end
+            end
+            dive.limbCollide = {}
+            dive.phase = "none"
+            dive.active = false
+        end
+        return
+    end
+end
+
+local function tryDive(b: BasePart): boolean
+    if not (char and root and myGoal) then return false end
+    if not gkNearGoal() then return false end
+    if now() - lastDive < CFG.DiveCooldown then return false end
+
+    local ballSpeed = b.AssemblyLinearVelocity.Magnitude
+    if ballSpeed < 8 then return false end
+
+    local ang = incomingAngle(b)
+    if ang < 0 or ang > CFG.IncomingConeDeg then return false end
+
+    local gk = root.Position
+    local hDist = Vector3.new(b.Position.X - gk.X, 0, b.Position.Z - gk.Z).Magnitude
+    if hDist > CFG.DiveTriggerRange then return false end
+
+    local cross = predictGoalCross(b)
+    if not cross then return false end
+
+    local lateralDist = math.abs(cross.Z - gk.Z)
+    if lateralDist < 0.4 then return false end
+    if lateralDist > CFG.DiveMaxDistance then return false end
+
+    lastDive = now()
+    startDive(cross.Z)
+    return true
+end
+
+------------------------------------------------------------------
+-- Marker
+------------------------------------------------------------------
+local function showMarker(pt: Vector3?)
+    if not CFG.ShowMarker then
+        if marker then marker:Destroy(); marker = nil end
+        return
+    end
+    if not pt then
+        if marker then marker:Destroy(); marker = nil end
+        return
+    end
+    if not marker or not marker.Parent then
+        local m = Instance.new("Part")
+        m.Name = "GKTarget"
+        m.Shape = Enum.PartType.Ball
+        m.Size = Vector3.new(0.6, 0.6, 0.6)
+        m.Anchored = true
+        m.CanCollide = false; m.CanQuery = false; m.CanTouch = false
+        m.Material = Enum.Material.Neon
+        m.Color = Color3.fromRGB(0, 255, 120)
+        m.Transparency = 0.5
+        m.Parent = Workspace
+        marker = m
+    end
+    marker.Position = pt
+end
+
+------------------------------------------------------------------
+-- GUI
+------------------------------------------------------------------
+local function makeDraggable(btn: GuiObject, onClick: (() -> ())?)
+    local dragging, startPos, startInput, moved = false, UDim2.new(), Vector2.new(), false
+    btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true; moved = false
+            startPos = btn.Position; startInput = input.Position
+        end
+    end)
+    UIS.InputChanged:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType ~= Enum.UserInputType.Touch
+            and input.UserInputType ~= Enum.UserInputType.MouseMovement then return end
+        local delta = input.Position - startInput
+        if delta.Magnitude > 8 then moved = true end
+        if moved then
+            btn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+        end
+    end)
+    UIS.InputEnded:Connect(function(input)
+        if not dragging then return end
+        if input.UserInputType == Enum.UserInputType.Touch
+            or input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+            if not moved and onClick then onClick() end
+        end
+    end)
+end
+
+local function styleBtn(btn: TextButton, color: Color3, text: string, radius: number)
+    btn.BackgroundColor3 = color; btn.BackgroundTransparency = 0.15
+    btn.TextColor3 = Color3.new(1,1,1); btn.Font = Enum.Font.GothamBold
+    btn.Text = text; btn.TextScaled = true; btn.BorderSizePixel = 0; btn.Active = true
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, radius); c.Parent = btn
+end
+
+local function buildGui()
+    local pg = LP:FindFirstChild("PlayerGui")
+    if not pg then return end
+    local old = pg:FindFirstChild("GKAssistGui")
+    if old then old:Destroy() end
+    local g = Instance.new("ScreenGui")
+    g.Name = "GKAssistGui"; g.ResetOnSpawn = false; g.IgnoreGuiInset = true
+    g.DisplayOrder = 100; g.Parent = pg
+    gui = g
+
+    local s = Instance.new("TextLabel")
+    s.Size = UDim2.fromOffset(380, 42)
+    s.Position = UDim2.new(0.5, -190, 0, 6)
+    s.BackgroundColor3 = Color3.fromRGB(0,0,0); s.BackgroundTransparency = 0.4
+    s.TextColor3 = Color3.fromRGB(0,255,150); s.Font = Enum.Font.Code; s.TextSize = 13
+    s.TextXAlignment = Enum.TextXAlignment.Left; s.Text = "GK: ..."
+    s.Parent = g
+    local sc = Instance.new("UICorner"); sc.CornerRadius = UDim.new(0,8); sc.Parent = s
+    statusLbl = s
+
+    local sb = Instance.new("TextButton")
+    sb.Size = UDim2.fromOffset(48, 48)
+    sb.Position = UDim2.new(1, -62, 0, 25)
+    styleBtn(sb, Color3.fromRGB(80,80,100), "⚙", 24)
+    sb.TextSize = 24; sb.Parent = g
+    settingsBtn = sb
+
+    local tb = Instance.new("TextButton")
+    tb.Size = UDim2.fromOffset(90, 48)
+    tb.Position = UDim2.new(1, -115, 0, 85)
+    styleBtn(tb, Color3.fromRGB(50,120,200), "ON", 20)
+    tb.TextSize = 18; tb.Parent = g
+    toggleBtn = tb
+
+    makeDraggable(sb, function()
+        if settingsPanel then settingsPanel.Visible = not settingsPanel.Visible end
+    end)
+    makeDraggable(tb, function()
+        assistOn = not assistOn
+        if toggleBtn then
+            toggleBtn.Text = assistOn and "ON" or "OFF"
+            toggleBtn.BackgroundColor3 = assistOn
+                and Color3.fromRGB(50,120,200) or Color3.fromRGB(150,50,50)
+        end
+    end)
+
+    local sp = Instance.new("Frame")
+    sp.Size = UDim2.fromOffset(300, 270)
+    sp.Position = UDim2.new(0.5, -150, 0.5, -135)
+    sp.BackgroundColor3 = Color3.fromRGB(20,20,30)
+    sp.BackgroundTransparency = 0.05; sp.BorderSizePixel = 0
+    sp.Visible = false; sp.Parent = g
+    local spc = Instance.new("UICorner"); spc.CornerRadius = UDim.new(0,12); spc.Parent = sp
+    settingsPanel = sp
+
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 44); title.BackgroundTransparency = 1
+    title.TextColor3 = Color3.fromRGB(0,255,150); title.Font = Enum.Font.GothamBold
+    title.TextSize = 20; title.Text = "SETTINGS"; title.Parent = sp
+
+    local function makeToggle(label: string, y: number, initial: boolean, onChanged: (boolean) -> ())
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(0.6, -10, 0, 44); lbl.Position = UDim2.new(0, 15, 0, y)
+        lbl.BackgroundTransparency = 1; lbl.TextColor3 = Color3.fromRGB(220,220,230)
+        lbl.Font = Enum.Font.Gotham; lbl.TextSize = 16
+        lbl.TextXAlignment = Enum.TextXAlignment.Left; lbl.Text = label; lbl.Parent = sp
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.fromOffset(80, 40); btn.Position = UDim2.new(0.7, 0, 0, y+2)
+        styleBtn(btn, initial and Color3.fromRGB(50,120,200) or Color3.fromRGB(120,50,50),
+            initial and "ON" or "OFF", 8)
+        btn.TextSize = 18; btn.Parent = sp
+        local state = initial
+        btn.Activated:Connect(function()
+            state = not state
+            btn.Text = state and "ON" or "OFF"
+            btn.BackgroundColor3 = state and Color3.fromRGB(50,120,200) or Color3.fromRGB(120,50,50)
+            onChanged(state)
+        end)
+    end
+
+    makeToggle("Assist", 60, CFG.AssistOn, function(v)
+        assistOn = v
+        if toggleBtn then
+            toggleBtn.Text = v and "ON" or "OFF"
+            toggleBtn.BackgroundColor3 = v and Color3.fromRGB(50,120,200) or Color3.fromRGB(150,50,50)
+        end
+    end)
+    makeToggle("Auto Dive", 110, CFG.AutoDive, function(v) CFG.AutoDive = v end)
+    makeToggle("Show Marker", 160, CFG.ShowMarker, function(v)
+        CFG.ShowMarker = v; if not v then showMarker(nil) end
+    end)
+    makeToggle("Show Status", 210, CFG.ShowStatus, function(v)
+        CFG.ShowStatus = v; if statusLbl then statusLbl.Visible = v end
+    end)
+
+    local close = Instance.new("TextButton")
+    close.Size = UDim2.fromOffset(120, 36); close.Position = UDim2.new(0.5, -60, 1, -46)
+    styleBtn(close, Color3.fromRGB(180,60,60), "CLOSE", 8)
+    close.TextSize = 16; close.Parent = sp
+    close.Activated:Connect(function() sp.Visible = false end)
+end
+
+------------------------------------------------------------------
+-- Character
+------------------------------------------------------------------
+local function onChar(c: Model)
+    char = c
+    root = c:WaitForChild("Root", 10) :: BasePart?
+    if not root then root = c:WaitForChild("HumanoidRootPart", 5) :: BasePart? end
+    isGK = c:GetAttribute("Role") == "Goalkeeper"
+    task.wait(0.3); detectMyGoal()
+end
+
+local function onCharRemoving()
+    char = nil; root = nil; isGK = false; myGoal = nil
+    assistVel = Vector3.new(0,0,0)
+    dive.active = false
+    dive.phase = "none"
+    dive.limbCollide = {}
+    showMarker(nil)
+end
+
+LP.CharacterAdded:Connect(onChar)
+LP.CharacterRemoving:Connect(onCharRemoving)
+if LP.Character then onChar(LP.Character) end
+
+buildGui()
+
+task.spawn(function()
+    while true do
+        task.wait(1)
+        if char and char.Parent then
+            isGK = char:GetAttribute("Role") == "Goalkeeper"
+            if not myGoal then detectMyGoal() end
+        end
+    end
+end)
+
+------------------------------------------------------------------
+-- Main loop
+------------------------------------------------------------------
+RunService.Heartbeat:Connect(function(dt)
+    if not (char and char.Parent and root and root.Parent) then
+        showMarker(nil); return
+    end
+
+    -- Dive animation (รวม phase hold + getup)
+    if dive.active then
+        updateDive()
+        if statusLbl and CFG.ShowStatus then
+            statusLbl.Text = "DIVE: " .. dive.phase
+        end
+        return
+    end
+
+    if not isGK then
+        if statusLbl and CFG.ShowStatus then statusLbl.Text = "not GK" end
+        showMarker(nil); return
+    end
+    if not myGoal then
+        if statusLbl and CFG.ShowStatus then statusLbl.Text = "no goal" end
+        showMarker(nil); return
+    end
+    if not gkNearGoal() then
+        if statusLbl and CFG.ShowStatus then statusLbl.Text = "too far from goal" end
+        showMarker(nil)
+        assistVel = assistVel * 0.5
+        return
+    end
